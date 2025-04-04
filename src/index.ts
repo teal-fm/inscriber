@@ -206,6 +206,7 @@ type LBZRequest = {
 app.post("/lbz/1/submit-listens", async (c: Context) => {
   console.log("/lbz/1/submit-listens");
   const body: LBZRequest = await c.req.json();
+  console.log("body", JSON.stringify(body));
   const token = c.req.header("Authorization")?.split("Token ")[1];
   if (!token) {
     return c.json({ error: "Missing token" }, 401);
@@ -226,6 +227,9 @@ app.post("/lbz/1/submit-listens", async (c: Context) => {
 
   for (const listen of body.payload) {
     const { track_name, artist_name, release_name } = listen.track_metadata;
+    if (!listen.listened_at) {
+      return c.json({ error: "Missing listened_at" }, 400);
+    }
 
     // Build query for MusicBrainz
     const queryParts: string[] = [];
