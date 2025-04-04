@@ -1,7 +1,9 @@
+import { Agent } from "@atproto/api";
 import { sanitizeUrl } from "@braintree/sanitize-url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { Hono } from "hono";
+import { eq } from "drizzle-orm";
+import { Context, Hono } from "hono";
 import { deleteCookie, getCookie } from "hono/cookie";
 import crypto from "node:crypto";
 import pino from "pino";
@@ -190,12 +192,154 @@ app.get("/apikey", (c) => {
   );
 });
 
-app.post("/lbz/1/submit-listens", async (c: TealContext) => {
-  const body = c.req.parseBody();
+type LBZRequest = {
+  listen_type: string;
+  payload: {
+    listened_at: number;
+    track_metadata: {
+      track_name: string;
+      artist_name: string;
+      release_name: string;
+    };
+  }[];
+};
+app.post("/lbz/1/submit-listens", async (c: Context) => {
+  console.log("/lbz/1/submit-listens");
+  const body: LBZRequest = await c.req.json();
+  const token = c.req.header("Authorization")?.split("Token ")[1];
+  if (!token) {
+    return c.json({ error: "Missing token" }, 401);
+  }
 
-  console.log(body);
+  const apiKeyRecord = (
+    await db.select().from(apiKey).where(eq(apiKey.key, token)).limit(1)
+  )[0];
 
-  return c.json({ success: true });
+  const oauthsession = await atclient.restore(apiKeyRecord.authorDid);
+  const agent = new Agent(oauthsession);
+  if (!agent) {
+    return c.json({ error: "Invalid token" }, 401);
+  }
+
+  // Process each listen in the payload
+  const processedListens = [];
+
+  for (const listen of body.payload) {
+    const { track_name, artist_name, release_name } = listen.track_metadata;
+
+    // Build query for MusicBrainz
+    const queryParts: string[] = [];
+    if (track_name) {
+      queryParts.push(`title:"${track_name}"`);
+    }
+
+    if (artist_name) {
+      queryParts.push(`artist:"${artist_name}"`);
+    }
+
+    if (release_name) {
+      queryParts.push(`release:"${release_name}"`);
+    }
+
+    const query = queryParts.join(" AND ");
+
+    try {
+      // Query MusicBrainz API
+      const res = await fetch(
+        `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(
+          query
+        )}&fmt=json`,
+        {
+          headers: {
+            "User-Agent": "tealtracker/0.0.1",
+          },
+        }
+      );
+
+      if (!res.ok) {
+        console.error(`MusicBrainz API returned ${res.status}`);
+        // Continue with basic data even if MusicBrainz query fails
+      } else {
+        const data = await res.json();
+        const recording = data.recordings?.[0]; // Get the first matching recording
+
+        if (recording) {
+          // Create a formatted listen entry according to the Lexicon schema
+          const playEntry = {
+            trackName: track_name,
+            trackMbId: recording.id || undefined,
+            recordingMbId: recording.id || undefined,
+            duration: recording.length
+              ? Math.floor(recording.length / 1000)
+              : undefined,
+            artistNames: recording["artist-credit"]
+              ? recording["artist-credit"].map((credit: any) => credit.name)
+              : [artist_name],
+            artistMbIds: recording["artist-credit"]
+              ? recording["artist-credit"]
+                  .map((credit: any) => credit.artist?.id)
+                  .filter(Boolean)
+              : undefined,
+            releaseName: recording.releases?.[0]?.title || release_name,
+            releaseMbId: recording.releases?.[0]?.id,
+            isrc: recording.isrcs?.[0],
+            musicServiceBaseDomain: "local", // Default value
+            submissionClientAgent: "teal-inscriber/0.0.1 (web)",
+            playedTime: new Date(listen.listened_at * 1000).toISOString(),
+          };
+
+          processedListens.push(playEntry);
+          continue;
+        }
+      }
+
+      // If MusicBrainz query fails or no match found, use basic data
+      const basicPlayEntry = {
+        trackName: track_name,
+        artistNames: [artist_name],
+        releaseName: release_name,
+        musicServiceBaseDomain: "local",
+        submissionClientAgent: "teal-inscriber/0.0.1 (web)",
+        playedTime: new Date(listen.listened_at * 1000).toISOString(),
+      };
+
+      processedListens.push(basicPlayEntry);
+    } catch (error) {
+      console.error("Error processing listen:", error);
+      // Add basic entry on error
+      const errorPlayEntry = {
+        trackName: track_name,
+        artistNames: [artist_name],
+        releaseName: release_name,
+        musicServiceBaseDomain: "local",
+        submissionClientAgent: "teal-inscriber/0.0.1 (web)",
+        playedTime: new Date(listen.listened_at * 1000).toISOString(),
+      };
+
+      processedListens.push(errorPlayEntry);
+    }
+  }
+
+  // Here you would typically save these processedListens to your database
+  // For now, we'll just log them
+  console.log("Processed listens:", JSON.stringify(processedListens));
+
+  // for each processed listen, create a play entry
+  for (const listen of processedListens) {
+    agent.com.atproto.repo.createRecord({
+      repo: agent.did ?? apiKeyRecord.authorDid,
+      collection: "fm.teal.alpha.feed.play",
+      record: {
+        ...listen,
+      },
+    });
+  }
+
+  return c.json({
+    success: true,
+    processedCount: processedListens.length,
+    processedListens,
+  });
 });
 
 app.post("/apikey", async (c: TealContext) => {
