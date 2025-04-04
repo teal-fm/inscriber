@@ -227,6 +227,7 @@ app.post("/lbz/1/submit-listens", async (c: Context) => {
 
   for (const listen of body.payload) {
     const { track_name, artist_name, release_name } = listen.track_metadata;
+    // TODO: could just make the server set this.
     if (!listen.listened_at) {
       return c.json({ error: "Missing listened_at" }, 400);
     }
